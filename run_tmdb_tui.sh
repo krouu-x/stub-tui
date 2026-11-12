@@ -2,12 +2,17 @@
 # Stub TUI Launcher - Linux/macOS
 # Run from the stub directory (parent of stub_main)
 
-cd "$(dirname "$0")/.."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/.."
 
 echo "Starting Stub TUI..."
 
-# Simple check - just run it, let Python handle errors
-if ! command -v python3 &> /dev/null; then
+# Use virtual environment if available (relative to stub_main folder)
+if [[ -f "$SCRIPT_DIR/venv/bin/python" ]]; then
+    PYTHON="$SCRIPT_DIR/venv/bin/python"
+elif command -v python3 &> /dev/null; then
+    PYTHON="python3"
+else
     echo "ERROR: python3 not found in PATH"
     echo "Install Python 3.10+ and add to PATH"
     read -p "Press Enter to exit"
@@ -21,7 +26,7 @@ if [[ ! -f "stub_main/main.py" ]]; then
     exit 1
 fi
 
-python3 -m stub_main.main
+"$PYTHON" -m stub_main.main
 
 # Pause on error so user can see the message
 if [[ $? -ne 0 ]]; then
