@@ -781,8 +781,13 @@ def main(stdscr):
 
 
 if __name__ == "__main__":
+    # Cross-platform log directory
+    log_dir = os.path.join(os.path.expanduser("~"), ".stub-tui", "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "tmdb_tui.log")
+
     logging.basicConfig(
-        filename="D:/Codes/IMP/stub/Logs/tmdb_tui.log",
+        filename=log_file,
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )

@@ -7,8 +7,8 @@ curl-cffi>=0.6.0
 beautifulsoup4>=4.12.0
 
 # Terminal UI - curses is in stdlib on Unix/Linux/macOS
-# On Windows, install: windows-curses
-# windows-curses>=2.3.0; sys_platform == "win32"
+# On Windows, install windows-curses
+windows-curses>=2.3.0; sys_platform == "win32"
 
 # Optional: For better TUI experience (not strictly required)
 # textual>=0.44.0
