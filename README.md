@@ -87,9 +87,15 @@ npm start
 ```
 
 **Terminal 2 - Start the TUI:**
-```bash
-python main.py
-```
+
+| Platform | Command |
+|----------|---------|
+| **Windows** | Double-click `run_tmdb_tui.bat` or run in cmd/powershell |
+| **Linux/macOS** | `chmod +x run_tmdb_tui.sh && ./run_tmdb_tui.sh` |
+| **Any (Python)** | `python run_tmdb_tui.py` |
+| **Direct** | `python -m stub_main.main` |
+
+> The TUI automatically starts the JS backend server when needed - no manual server management required!
 
 ---
 
