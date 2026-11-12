@@ -7,11 +7,12 @@ cd "$SCRIPT_DIR/.."
 
 echo "Starting Stub TUI..."
 
-# Use virtual environment if available (relative to stub_main folder)
-if [[ -f "$SCRIPT_DIR/venv/bin/python" ]]; then
-    PYTHON="$SCRIPT_DIR/venv/bin/python"
+# Activate virtual environment
+if [[ -f "$SCRIPT_DIR/venv/bin/activate" ]]; then
+    source "$SCRIPT_DIR/venv/bin/activate"
+    echo "Virtual environment activated"
 elif command -v python3 &> /dev/null; then
-    PYTHON="python3"
+    echo "No venv found, using system python3"
 else
     echo "ERROR: python3 not found in PATH"
     echo "Install Python 3.10+ and add to PATH"
@@ -26,7 +27,7 @@ if [[ ! -f "stub_main/main.py" ]]; then
     exit 1
 fi
 
-"$PYTHON" -m stub_main.main
+python -m stub_main.main
 
 # Pause on error so user can see the message
 if [[ $? -ne 0 ]]; then
