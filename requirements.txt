@@ -1,0 +1,15 @@
+# Python dependencies for Stub TUI
+
+# HTTP client with browser fingerprinting (required for streaming providers)
+curl-cffi>=0.6.0
+
+# HTML parsing (used by 4KHDHub provider)
+beautifulsoup4>=4.12.0
+
+# Terminal UI - curses is in stdlib on Unix/Linux/macOS
+# On Windows, install: windows-curses
+# windows-curses>=2.3.0; sys_platform == "win32"
+
+# Optional: For better TUI experience (not strictly required)
+# textual>=0.44.0
+# rich>=13.0.0
