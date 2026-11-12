@@ -1,0 +1,86 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Python build / packaging
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+lib/
+lib64/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Secrets / environment files
+.env
+.env.*
+!.env.example
+
+# User settings & runtime data
+settings.json
+history.json
+server/user-config.json
+server/utils/user-config.json
+logs/
+*.log
+*.pid
+*.seed
+server/restart.trigger
+
+# Node.js
+server/node_modules/
+server/npm-debug.log*
+server/yarn-debug.log*
+server/yarn-error.log*
+server/pnpm-debug.log*
+
+# Docker
+server/docker-compose.override.yml
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Testing / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.mypy_cache/
+*.cover
+*.py,cover
+
+# Distribution
+*.tar.gz
+*.whl
+
+# Screenshots
+server/screenshots/
