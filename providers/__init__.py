@@ -4,7 +4,7 @@
 from dataclasses import dataclass
 from typing import Callable, List, Tuple, Dict, Optional
 
-from .js_server import fetch as fetch_js_server, get_available_providers
+from .js_server import fetch as fetch_js_server, fetch_streams as fetch_js_server_streams, get_available_providers
 
 
 @dataclass
@@ -38,6 +38,7 @@ __all__ = [
     "StreamProvider",
     "PROVIDERS",
     "fetch_js_server",
+    "fetch_js_server_streams",
     "get_available_providers",
     "fetch_fourkhdhub",
     "fetch_dramachi",

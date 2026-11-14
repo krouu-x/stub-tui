@@ -12,6 +12,14 @@ if (!SERVER_VERBOSE) console.log = () => {};
 const express = require('express');
 const cors = require('cors');
 const os = require('os');
+
+// Reuse upstream TLS/TCP connections where possible. Providers make several
+// requests per scrape, so keep-alive removes repeated handshakes. (Recent
+// Node versions default to keep-alive already; this keeps older ones fast.)
+const http = require('http');
+const https = require('https');
+http.globalAgent.keepAlive = true;
+https.globalAgent.keepAlive = true;
 const { config, saveConfigPatch, OVERRIDE_PATH } = require('./utils/config');
 const { authenticate, issueSession, requireAuth, getSession, updatePassword } = require('./utils/auth');
 const path = require('path');
@@ -202,12 +210,39 @@ const metrics = {
 
 // --- Short-lived aggregate stream cache ---
 // Navigating streams -> play -> back, or retrying playback, re-runs every
-// provider scrape. Reuse the last successful aggregate response for a minute
-// so repeated requests are effectively free. The key includes the config that
-// affects the result so a settings change cannot serve a stale payload.
-const STREAM_CACHE_TTL_MS = 60 * 1000;
+// provider scrape. Reuse the last successful aggregate response so repeated
+// requests are effectively free. The key includes the config that affects the
+// result so a settings change cannot serve a stale payload.
+const STREAM_CACHE_TTL_MS = Math.max(
+  1000,
+  Number(process.env.TMDB_STREAM_CACHE_TTL_MS) || 2 * 60 * 1000
+);
+// After the fresh TTL, still serve the previous payload instantly while a
+// refresh runs in the background (stale-while-revalidate).
+const STREAM_CACHE_STALE_MS = Math.max(
+  0,
+  Number(process.env.TMDB_STREAM_CACHE_STALE_MS) || 3 * 60 * 1000
+);
+// Never make the caller wait for the slowest provider. Whatever has arrived
+// by this deadline is returned (and cached); remaining providers keep filling
+// the cache in the background. Set TMDB_AGGREGATE_DEADLINE_MS=0 to always
+// wait for every provider.
+const AGGREGATE_SOFT_DEADLINE_MS = process.env.TMDB_AGGREGATE_DEADLINE_MS === undefined
+  ? 6000
+  : Math.max(0, Number(process.env.TMDB_AGGREGATE_DEADLINE_MS) || 0);
+// Playback asks with ?fast=1: waiting a few seconds for every provider is
+// pointless when the first working link can start playing right away, so use
+// a much shorter deadline there. The remaining providers still fill the cache
+// for the next request / retry.
+const FAST_DEADLINE_MS = process.env.TMDB_FAST_DEADLINE_MS === undefined
+  ? 2000
+  : Math.max(0, Number(process.env.TMDB_FAST_DEADLINE_MS) || 0);
 const STREAM_CACHE_MAX = 128;
 const streamCache = new Map();
+// One scrape per cache key. Concurrent requests (e.g. opening the downloads
+// screen and immediately pressing play) share the same provider calls instead
+// of duplicating every upstream request.
+const inflightScrapes = new Map();
 
 function streamCacheSignature() {
   return JSON.stringify({
@@ -225,16 +260,137 @@ function streamCacheKey(type, tmdbId, season, episode) {
 function getCachedStreams(key) {
   const entry = streamCache.get(key);
   if (!entry) return null;
-  if ((Date.now() - entry.ts) > STREAM_CACHE_TTL_MS) {
+  const age = Date.now() - entry.ts;
+  if (age > STREAM_CACHE_TTL_MS + STREAM_CACHE_STALE_MS) {
     streamCache.delete(key);
     return null;
   }
-  return entry.payload;
+  return { payload: entry.payload, stale: age > STREAM_CACHE_TTL_MS };
 }
 
 function setCachedStreams(key, payload) {
-  if (streamCache.size >= STREAM_CACHE_MAX) streamCache.clear();
+  if (streamCache.size >= STREAM_CACHE_MAX && !streamCache.has(key)) {
+    // Evict only the oldest entry rather than clearing the whole cache.
+    let oldestKey = null;
+    let oldestTs = Infinity;
+    for (const [k, v] of streamCache) {
+      if (v.ts < oldestTs) { oldestTs = v.ts; oldestKey = k; }
+    }
+    if (oldestKey !== null) streamCache.delete(oldestKey);
+  }
   streamCache.set(key, { ts: Date.now(), payload });
+}
+
+function aggregatePayload(state, partial) {
+  const streams = [];
+  for (const name of state.providers) {
+    const result = state.results.get(name);
+    if (Array.isArray(result)) streams.push(...result);
+  }
+  const filtered = applyFilters(streams, 'aggregate', config.minQualities, config.excludeCodecs);
+  const payload = {
+    success: true,
+    tmdbId: state.tmdbId,
+    imdbId: state.imdbId,
+    count: filtered.length,
+    providerTimings: { ...state.timings },
+    streams: filtered
+  };
+  if (partial) {
+    payload.partial = true;
+    payload.pendingProviders = Array.from(state.pending);
+  }
+  return payload;
+}
+
+// Start (or reuse) a single scrape for a cache key. The returned state exposes
+// a `promise` for the complete payload and per-provider results as they land,
+// so callers can respond early without cancelling the remaining work.
+function startScrape(type, tmdbId, season, episode, selectedProviders) {
+  const key = streamCacheKey(type, tmdbId, season, episode);
+  const existing = inflightScrapes.get(key);
+  if (existing) return existing;
+
+  const tmdbType = type === 'movie' ? 'movie' : 'tv';
+  const state = {
+    key,
+    type,
+    tmdbId,
+    season,
+    episode,
+    providers: selectedProviders.slice(),
+    results: new Map(),
+    timings: {},
+    pending: new Set(selectedProviders),
+    imdbId: null,
+    startedAt: Date.now(),
+    finishedAt: null,
+    promise: null
+  };
+
+  // IMDb is only response enrichment, so it must never delay the scrape.
+  const imdbPromise = resolveImdbId(tmdbType, tmdbId)
+    .then(id => {
+      if (id) { metrics.tmdbToImdbLookups++; state.imdbId = id; }
+      return id;
+    })
+    .catch(() => null);
+
+  const providerPromises = selectedProviders.map(async name => {
+    const prov = getProvider(name);
+    if (!prov || !prov.enabled) {
+      state.pending.delete(name);
+      return;
+    }
+    metrics.providerCalls[name] = (metrics.providerCalls[name] || 0) + 1;
+    const t0 = Date.now();
+    try {
+      console.log(`[api] invoking provider ${name} for tmdbId=${tmdbId}`);
+      const r = await prov.fetch({ tmdbId, type, season, episode, imdbId: null, filters: {} });
+      if (Array.isArray(r) && r.length) state.results.set(name, r);
+      state.timings[name] = Date.now() - t0;
+      console.log(`[api] provider ${name} returned ${Array.isArray(r) ? r.length : 0} streams`);
+    } catch (e) {
+      console.error(`[api] provider ${name} failed:`, e.message);
+      state.timings[name] = null;
+    } finally {
+      state.pending.delete(name);
+    }
+  });
+
+  state.promise = (async () => {
+    await Promise.all(providerPromises);
+    await imdbPromise;
+    state.finishedAt = Date.now();
+    const payload = aggregatePayload(state, false);
+    // Only cache a successful response that actually has streams; an empty
+    // result is often a transient provider hiccup and is worth retrying.
+    if (payload.streams.length > 0) setCachedStreams(key, payload);
+    return payload;
+  })().catch(e => {
+    metrics.lastError = e.message;
+    return aggregatePayload(state, false);
+  }).finally(() => {
+    inflightScrapes.delete(key);
+  });
+
+  inflightScrapes.set(key, state);
+  return state;
+}
+
+function waitForScrapeDeadline(state, timeoutMs) {
+  if (state.finishedAt) return Promise.resolve('done');
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = (outcome) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(outcome);
+    };
+    const timer = setTimeout(() => finish('deadline'), Math.max(0, timeoutMs));
+    state.promise.then(() => finish('done'), () => finish('done'));
+  });
 }
 
 app.use((req,res,next)=>{ metrics.requestsTotal++; metrics.lastRequestAt = Date.now(); next(); });
@@ -374,62 +530,68 @@ app.get('/api/streams/:type/:tmdbId', async (req,res) => {
   const season = req.query.season ? Number(req.query.season) : null;
   const episode = req.query.episode ? Number(req.query.episode) : null;
   const cacheKey = streamCacheKey(type, tmdbId, season, episode);
-  const cached = getCachedStreams(cacheKey);
-  if (cached) {
-    metrics.streamCacheHits++;
-    let cachedStreams = cached.streams;
-    if (config.enableProxy) {
-      const serverUrl = `${req.protocol}://${req.get('host')}`;
-      cachedStreams = processStreamsForProxy(cachedStreams, serverUrl);
-      cachedStreams = cachedStreams.map(s => { if (s && typeof s === 'object') { const { headers, ...rest } = s; return rest; } return s; });
-    }
-    return res.json({ ...cached, streams: cachedStreams, cached: true });
-  }
-  try {
-    metrics.streamRequests++;
-    const tmdbType = type === 'movie' ? 'movie' : 'tv';
-    // Providers do their own IMDb resolution; this lookup only enriches the
-    // response, so run it concurrently with the provider scrapes instead of
-    // delaying them.
-    const imdbPromise = resolveImdbId(tmdbType, tmdbId)
-      .then(id => { if (id) metrics.tmdbToImdbLookups++; return id; })
-      .catch(() => null);
-    const selectedProviders = (config.defaultProviders.length ? config.defaultProviders : listProviders().map(p=>p.name));
-    const providerTimings = {};
-    const [results, imdbId] = await Promise.all([
-      Promise.all(selectedProviders.map(async name => {
-        const prov = getProvider(name);
-        if (!prov || !prov.enabled) return [];
-        metrics.providerCalls[name] = (metrics.providerCalls[name]||0)+1;
-        try {
-          console.log(`[api] invoking provider ${name} for tmdbId=${tmdbId}`);
-          const t0 = Date.now();
-          const r = await prov.fetch({ tmdbId, type, season, episode, imdbId: null, filters:{ } });
-          providerTimings[name] = Date.now()-t0;
-          console.log(`[api] provider ${name} returned ${Array.isArray(r)?r.length:0} streams`);
-          return r;
-        } catch (e) {
-          console.error(`[api] provider ${name} failed:`, e.message);
-          providerTimings[name] = null;
-          return [];
-        }
-      })),
-      imdbPromise,
-    ]);
-    let streams = results.flat();
-    streams = applyFilters(streams, 'aggregate', config.minQualities, config.excludeCodecs);
-    metrics.streamsReturned += streams.length;
-    const payload = { success:true, tmdbId, imdbId, count: streams.length, providerTimings, streams };
-    // Only cache a successful response that actually has streams; an empty
-    // result is often a transient provider hiccup and is worth retrying.
-    if (streams.length > 0) setCachedStreams(cacheKey, payload);
+  const selectedProviders = (config.defaultProviders.length ? config.defaultProviders : listProviders().map(p=>p.name));
+  const requestDeadlineMs = String(req.query.fast || '') === '1'
+    ? FAST_DEADLINE_MS
+    : AGGREGATE_SOFT_DEADLINE_MS;
+
+  const sendPayload = (payload, cached) => {
+    let streams = payload.streams;
     if (config.enableProxy) {
       const serverUrl = `${req.protocol}://${req.get('host')}`;
       streams = processStreamsForProxy(streams, serverUrl);
       // Omit original headers when proxying to avoid leaking upstream requirements
       streams = streams.map(s => { if (s && typeof s === 'object') { const { headers, ...rest } = s; return rest; } return s; });
     }
-    res.json({ ...payload, streams });
+    return res.json({ ...payload, streams, ...(cached ? { cached: true } : {}) });
+  };
+
+  const cached = getCachedStreams(cacheKey);
+  if (cached) {
+    metrics.streamCacheHits++;
+    // Stale entries are returned immediately while a refresh fills the cache,
+    // so going back to a title never waits for a fresh scrape.
+    if (cached.stale && !inflightScrapes.has(cacheKey)) {
+      startScrape(type, tmdbId, season, episode, selectedProviders);
+    }
+    return sendPayload(cached.payload, true);
+  }
+
+  try {
+    metrics.streamRequests++;
+    let state = inflightScrapes.get(cacheKey);
+    const joinedInFlight = !!state;
+    if (!state) {
+      state = startScrape(type, tmdbId, season, episode, selectedProviders);
+    }
+
+    let payload;
+    if (state.finishedAt) {
+      payload = await state.promise;
+    } else if (joinedInFlight && state.results.size > 0) {
+      // Another request already started this scrape and has early results:
+      // answer instantly instead of waiting the soft deadline a second time.
+      payload = aggregatePayload(state, true);
+    } else {
+      const elapsed = Date.now() - state.startedAt;
+      const remaining = requestDeadlineMs - elapsed;
+      const outcome = requestDeadlineMs > 0
+        ? await waitForScrapeDeadline(state, remaining)
+        : 'done';
+      if (outcome === 'done') {
+        payload = await state.promise;
+      } else if (state.results.size > 0) {
+        // Return what is ready; the remaining providers keep filling the cache.
+        payload = aggregatePayload(state, true);
+      } else {
+        // No provider has produced anything yet — waiting for a partial-empty
+        // response would be useless, so fall back to the full (bounded) scrape.
+        payload = await state.promise;
+      }
+    }
+
+    metrics.streamsReturned += payload.streams.length;
+    return sendPayload(payload, false);
   } catch (e) {
     metrics.lastError = e.message;
     res.status(500).json({ success:false, error:'INTERNAL_ERROR', message:e.message });

@@ -5,6 +5,23 @@ const cheerio = require('cheerio');
 const fs = require('fs').promises;
 const path = require('path');
 
+// Run an async worker over a list with bounded concurrency. Redirect
+// resolution is network-bound and independent per link, so doing it serially
+// made this provider the slowest one by several seconds.
+async function mapWithConcurrency(items, limit, worker) {
+    const results = new Array(items.length);
+    let next = 0;
+    const runners = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, async () => {
+        for (;;) {
+            const index = next++;
+            if (index >= items.length) return;
+            results[index] = await worker(items[index], index);
+        }
+    });
+    await Promise.all(runners);
+    return results;
+}
+
 // Configuration
 const DOMAINS_URL = 'https://raw.githubusercontent.com/phisher98/TVVVV/refs/heads/main/domains.json';
 let cachedDomains = null;
@@ -1776,33 +1793,30 @@ async function get4KHDHubStreams(tmdbId, type, season = null, episode = null) {
                 return [];
             }
 
-            // Resolve redirect URLs to actual file hosting URLs
+            // Resolve redirect URLs to actual file hosting URLs. Resolve a few
+            // concurrently (bounded to stay friendly to the upstream hosts)
+            // instead of one-by-one, which dominated the total scrape time.
             console.log(`[4KHDHub] Resolving ${downloadLinks.length} redirect URLs to file hosting URLs...`);
-            const resolvedUrls = [];
-
-            for (let i = 0; i < downloadLinks.length; i++) {
-                const link = downloadLinks[i];
-                console.log(`[4KHDHub] Resolving link ${i + 1}/${downloadLinks.length}: ${link}`);
-
+            const resolved = await mapWithConcurrency(downloadLinks, 5, async (link, i) => {
+                const label = `link ${i + 1}/${downloadLinks.length}`;
                 try {
                     if (link.toLowerCase().includes('id=')) {
-                        // This is a redirect URL, resolve it
                         const resolvedUrl = await getRedirectLinks(link);
                         if (resolvedUrl && resolvedUrl.trim()) {
-                            console.log(`[4KHDHub] Link ${i + 1} resolved to: ${resolvedUrl}`);
-                            resolvedUrls.push(resolvedUrl);
-                        } else {
-                            console.log(`[4KHDHub] Link ${i + 1} resolution failed or returned empty`);
+                            console.log(`[4KHDHub] ${label} resolved to: ${resolvedUrl}`);
+                            return resolvedUrl;
                         }
-                    } else {
-                        // Direct URL, use as-is
-                        console.log(`[4KHDHub] Link ${i + 1} is direct URL: ${link}`);
-                        resolvedUrls.push(link);
+                        console.log(`[4KHDHub] ${label} resolution failed or returned empty`);
+                        return null;
                     }
+                    console.log(`[4KHDHub] ${label} is direct URL: ${link}`);
+                    return link;
                 } catch (error) {
-                    console.error(`[4KHDHub] Error resolving link ${i + 1} (${link}):`, error.message);
+                    console.error(`[4KHDHub] Error resolving ${label} (${link}):`, error.message);
+                    return null;
                 }
-            }
+            });
+            const resolvedUrls = resolved.filter(url => typeof url === 'string' && url.trim());
 
             if (resolvedUrls.length === 0) {
                 console.log(`[4KHDHub] No URLs resolved successfully`);

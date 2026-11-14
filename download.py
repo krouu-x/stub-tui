@@ -2,6 +2,8 @@
 import os
 import re
 import time
+import shutil
+import tempfile
 import subprocess
 import threading
 import logging
@@ -13,10 +15,33 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from curl_cffi import requests
 
-from stub_main.config import BROWSER_HEADERS, DEFAULT_PLAYER
+from stub_main.config import BROWSER_HEADERS, DEFAULT_PLAYER, SCREEN_DOWNLOADS
 from stub_main.metadata import _fetch_content_length, _format_size
 
 log = logging.getLogger("tmdb_tui.download")
+
+# Live refresh of the downloads screen while the server is still resolving
+# providers. Polling is cheap: once the scrape completes the server answers
+# from its cache in a few milliseconds.
+LIVE_LINK_POLL_INTERVAL = 0.6
+LIVE_LINK_MAX_SECONDS = 30.0
+LIVE_LINK_MAX_FAILURES = 5
+
+# VLC exits 0 even when it could not demux or decode anything (it just says
+# "end of playlist, exiting"), so its output is inspected to detect a failed
+# attempt. This happens on Linux installs where VLC's optional codec plugins
+# (ffmpeg/HEVC/E-AC3, MPEG-TS demux) are not installed: mpv, which decodes via
+# ffmpeg, can still play the stream.
+VLC_FAILURE_MARKERS = (
+    "is not supported",
+    "codec not supported",
+    "could not decode the format",
+    "failed to create demuxer",
+    "no suitable decoder",
+    "cannot find input plugin",
+    "unable to open the mrl",
+)
+VLC_EARLY_FAILURE_SECONDS = 20.0
 
 
 class DownloadManager:
@@ -32,6 +57,17 @@ class DownloadManager:
         self.sd_cancel = False
         self.sd_episodes = []
         self.sd_index = 0
+        # Live downloads-list updates: True while the server is still resolving
+        # providers and more links may arrive for the list being shown.
+        self.links_partial = False
+        self._live_token = 0
+        self._live_stop = threading.Event()
+        self._live_thread: Optional[threading.Thread] = None
+        # Set when VLC proves unable to play a stream (e.g. missing codec
+        # plugins); the rest of the session then uses mpv instead.
+        self._vlc_unusable = False
+        self._vlc_failed_early = False
+        self._playback_note = ""
 
     def gather_download_links(
         self,
@@ -63,8 +99,178 @@ class DownloadManager:
                 links.append((url, headers, provider.name))
         return links
 
+    def resolve_download_links(
+        self,
+        tmdb_id: str,
+        title: str,
+        media_type: str,
+        season_num: str,
+        episode_num: str,
+        year: str = "",
+        fast: bool = False,
+    ) -> Tuple[List[Tuple[str, Dict[str, str], str]], bool]:
+        """Resolve links for the downloads screen, reporting completeness.
+
+        When the JS Server is the only provider (the default setup) this asks
+        it to answer early (``fast``) so the first links paint immediately,
+        returning ``(links, partial)``. Any other provider setup falls back to
+        the blocking gather and is reported as complete.
+
+        This never touches curses state so it is safe to call from the
+        live-update worker thread.
+        """
+        from .providers import PROVIDERS, fetch_js_server_streams
+
+        if len(PROVIDERS) == 1 and PROVIDERS[0].name == "JS Server":
+            provider_name = PROVIDERS[0].name
+            streams, is_partial = fetch_js_server_streams(
+                tmdb_id,
+                title,
+                media_type,
+                season_num,
+                episode_num,
+                year=year,
+                fast=fast,
+            )
+            return [(url, headers, provider_name) for url, headers in streams], is_partial
+
+        return (
+            self.gather_download_links(
+                tmdb_id, title, media_type, season_num, episode_num, year=year
+            ),
+            False,
+        )
+
+    def start_live_link_updates(
+        self,
+        tmdb_id: str,
+        title: str,
+        media_type: str,
+        season_num: str,
+        episode_num: str,
+        year: str = "",
+    ) -> None:
+        """Poll the server in the background and refresh the list in place.
+
+        The server keeps resolving providers after it answers with a partial
+        payload. While the downloads screen is visible, fetch again every
+        ``LIVE_LINK_POLL_INTERVAL`` seconds and swap the list as new links
+        arrive, preserving the user's selection by URL. Stops once the server
+        reports a complete result, the user leaves the screen, or the deadline
+        passes.
+        """
+        self.stop_live_link_updates()
+        self._live_token += 1
+        self._live_stop = threading.Event()
+        self.links_partial = True
+        token = self._live_token
+        stop = self._live_stop
+
+        def worker():
+            deadline = time.monotonic() + LIVE_LINK_MAX_SECONDS
+            failures = 0
+            while not stop.is_set() and token == self._live_token:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log.info("Live link updates: deadline reached, stopping")
+                    return
+                if stop.wait(min(LIVE_LINK_POLL_INTERVAL, remaining)):
+                    return
+                if token != self._live_token:
+                    return
+                if getattr(self.app, "screen", None) != SCREEN_DOWNLOADS:
+                    return
+                try:
+                    new_links, partial = self.resolve_download_links(
+                        tmdb_id,
+                        title,
+                        media_type,
+                        season_num,
+                        episode_num,
+                        year=year,
+                        fast=True,
+                    )
+                except Exception as e:
+                    # Keep the links already shown and retry: the server may
+                    # be mid-scrape and briefly unavailable. Give up only after
+                    # repeated failures so we do not poll forever.
+                    failures += 1
+                    log.warning("Live link update failed (%d): %s", failures, e)
+                    if failures >= LIVE_LINK_MAX_FAILURES:
+                        return
+                    continue
+                failures = 0
+                if token != self._live_token:
+                    return
+                if new_links:
+                    self._replace_download_links(new_links)
+                self.links_partial = partial
+                if partial:
+                    self.app.status = self._loading_hint(len(self.download_links))
+                else:
+                    self.app.status = self._downloads_hint(len(self.download_links))
+                    log.info("Live link updates: complete with %d link(s)", len(self.download_links))
+                    return
+
+        self._live_thread = threading.Thread(
+            target=worker, name="live-link-updates", daemon=True
+        )
+        self._live_thread.start()
+
+    def stop_live_link_updates(self) -> None:
+        """Cancel any in-flight live refresh (idempotent).
+
+        The worker is a daemon thread and only publishes results while its
+        token is current, so it is invalidated rather than joined: joining
+        would block the main thread (and playback start) for as long as the
+        in-flight request takes.
+        """
+        self._live_token += 1
+        self._live_stop.set()
+        self.links_partial = False
+        self._live_thread = None
+
+    def _replace_download_links(
+        self, new_links: List[Tuple[str, Dict[str, str], str]]
+    ) -> None:
+        """Swap in a fresher link list, keeping the user's selection stable."""
+        old_links = self.download_links
+        selected = self.download_selected
+        old_url = old_links[selected][0] if 0 <= selected < len(old_links) else None
+
+        self.download_links = new_links
+        if old_url is not None:
+            for idx, (url, _headers, _provider) in enumerate(new_links):
+                if url == old_url:
+                    self.download_selected = idx
+                    break
+            else:
+                self.download_selected = min(selected, len(new_links) - 1)
+        else:
+            self.download_selected = 0
+        self.download_selected = max(0, min(self.download_selected, len(new_links) - 1))
+
+        # Probe sizes only for links we have not measured yet.
+        fresh = [link for link in new_links if link[0] not in self._link_sizes]
+        if fresh:
+            self.prefetch_link_sizes_async(fresh)
+
+    @staticmethod
+    def _downloads_hint(count: int) -> str:
+        return f"Stream links ({count} unique): p play   d download   Esc back"
+
+    @staticmethod
+    def _loading_hint(count: int) -> str:
+        return (
+            f"Stream links ({count} so far) — still loading more… "
+            "p play   d download   Esc back"
+        )
+
     def _prefetch_link_sizes(self, links: List[Tuple[str, Dict[str, str], str]]) -> None:
         """Best-effort parallel Content-Length probe for the resolved links."""
+        links = [link for link in links if link[0] not in self._link_sizes]
+        if not links:
+            return
         with ThreadPoolExecutor(max_workers=min(8, len(links))) as ex:
             futures = {
                 ex.submit(_fetch_content_length, url, headers): (url, headers)
@@ -78,6 +284,28 @@ class DownloadManager:
                         self._link_sizes[url] = size
                 except Exception:
                     pass
+
+    def prefetch_link_sizes_async(self, links, on_done=None) -> None:
+        """Probe Content-Length off the main thread, skipping known URLs."""
+        link_list = [link for link in links if link[0] not in self._link_sizes]
+        if not link_list:
+            return
+
+        def worker():
+            try:
+                self._prefetch_link_sizes(link_list)
+            except Exception:
+                pass
+            finally:
+                if on_done is not None:
+                    try:
+                        on_done()
+                    except Exception:
+                        pass
+
+        threading.Thread(
+            target=worker, name="link-size-probe", daemon=True
+        ).start()
 
     def _player_backend(self, backend: Optional[str] = None) -> str:
         """Resolve the playback backend to use ('mpv' or 'vlc')."""
@@ -114,6 +342,14 @@ class DownloadManager:
         """Build the mpv argv list for a stream (no shell, no embedded quotes)."""
         cmd = ["mpv", "--no-ytdl"]
 
+        # mpv's default network timeout is 60s, so a dead first link can waste a
+        # minute before the app moves on to the next candidate. Fail over
+        # sooner (still tolerant of slow CDNs). Override with
+        # TMDB_MPV_NETWORK_TIMEOUT, or set it to 0 for mpv's default.
+        net_timeout = os.environ.get("TMDB_MPV_NETWORK_TIMEOUT", "15").strip()
+        if net_timeout and net_timeout != "0":
+            cmd.append(f"--network-timeout={net_timeout}")
+
         if start_position and start_position > 0:
             cmd.append(f"--start={start_position}")
 
@@ -131,9 +367,17 @@ class DownloadManager:
         extra_headers = [
             f"{k}: {v}" for k, v in stream_headers.items()
             if k.lower() not in ("user-agent", "referer")
+            and v
         ]
-        if extra_headers:
-            cmd.append("--http-header-fields=" + ",".join(extra_headers))
+        # mpv's --http-header-fields-add takes a single "Name: value" field.
+        # Header values that themselves contain commas (Accept lists like
+        # "video/webm,video/ogg,...") get mangled by ffmpeg and the CDN answers
+        # with HTTP 400, so skip those — ffmpeg's defaults are fine for them.
+        for k, v in stream_headers.items():
+            key = k.lower()
+            if key in ("user-agent", "referer") or not v or "," in v:
+                continue
+            cmd.append(f"--http-header-fields-add={k}: {v}")
 
         cmd.append(stream_url)
         return cmd
@@ -143,10 +387,41 @@ class DownloadManager:
 
         VLC exposes no IPC/progress tracking and no direct start-position flag,
         so playback always starts from the beginning and progress is not tracked.
+
+        VLC has no generic header option, but it does honour its HTTP
+        user-agent/referrer settings; without them many CDNs answer 403.
         """
         cmd = ["vlc", "--play-and-exit"]
+
+        ua = stream_headers.get("User-Agent") or stream_headers.get("user-agent")
+        if ua:
+            cmd.append(f"--http-user-agent={ua}")
+
+        referer = stream_headers.get("Referer") or stream_headers.get("referer")
+        if referer:
+            cmd.append(f"--http-referrer={referer}")
+
         cmd.append(stream_url)
         return cmd
+
+    @staticmethod
+    def _vlc_failed(output: str, elapsed: float) -> bool:
+        """True when VLC reported a demux/decode failure shortly after start.
+
+        A failure after a long play time is treated as a mid-playback problem
+        (the user already watched something), not as a reason to restart the
+        stream in another player.
+        """
+        if elapsed > VLC_EARLY_FAILURE_SECONDS:
+            return False
+        text = output.lower()
+        return any(marker in text for marker in VLC_FAILURE_MARKERS)
+
+    def take_playback_note(self) -> str:
+        """Return and clear the one-shot note about the last playback."""
+        note = self._playback_note
+        self._playback_note = ""
+        return note
 
     def _save_playback_progress(self, item_info: dict, state: dict):
         """Persist playback progress to history (best effort, no crash)."""
@@ -200,23 +475,58 @@ class DownloadManager:
         cmd = self._vlc_command(stream_url, stream_headers)
 
         proc = None
+        output = ""
+        elapsed = 0.0
+        started = time.monotonic()
+        self._vlc_failed_early = False
+        # Capture VLC's log so a silent "failed to decode" exit can be
+        # distinguished from a real end of playback. A temp file (not a pipe)
+        # avoids deadlocking when VLC logs a lot.
+        log_file = tempfile.TemporaryFile()
         try:
             import curses
             curses.endwin()
-            proc = subprocess.Popen(cmd)
+            proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
             proc.wait()
-            curses.reset_prog_mode()
-            curses.doupdate()
-            self.app.stdscr.refresh()
         except FileNotFoundError:
+            self._vlc_failed_early = True
             self.app.status = "Error: 'vlc' executable not found."
             return -1
         except Exception as e:
             log.warning("Playback error: %s", e)
             return -1
         finally:
+            elapsed = time.monotonic() - started
+            try:
+                import curses
+                curses.reset_prog_mode()
+                curses.doupdate()
+            except Exception:
+                pass
+            try:
+                self.app.stdscr.refresh()
+            except Exception:
+                pass
             self.app._ipc_path = None
             self.app._playback_state = None
+            try:
+                log_file.seek(0)
+                output = log_file.read().decode("utf-8", "replace")
+            except Exception:
+                output = ""
+            log_file.close()
+
+        if self._vlc_failed(output, elapsed):
+            self._vlc_failed_early = True
+            tail = "\n".join(output.strip().splitlines()[-6:])
+            log.warning(
+                "VLC could not play the stream after %.1fs (missing codecs?):\n%s",
+                elapsed,
+                tail,
+            )
+            return proc.returncode or 1
+        if proc is not None and proc.returncode != 0 and elapsed <= VLC_EARLY_FAILURE_SECONDS:
+            self._vlc_failed_early = True
         return proc.returncode if proc else -1
 
     def _run_mpv_with_progress(
@@ -296,8 +606,31 @@ class DownloadManager:
             except (TypeError, ValueError):
                 resume = 0.0
         if backend == "vlc":
-            # VLC has no start-position flag / progress tracking; start over.
-            return self._run_vlc(stream_url, stream_headers, item)
+            mpv_available = shutil.which("mpv") is not None
+            if not self._vlc_unusable:
+                # VLC has no start-position flag / progress tracking; start over.
+                code = self._run_vlc(stream_url, stream_headers, item)
+                if code == 0 or not self._vlc_failed_early or not mpv_available:
+                    return code
+                self._vlc_unusable = True
+                self._playback_note = (
+                    "VLC can't decode this stream (missing plugins) — using "
+                    "mpv. Arch: install vlc-plugins-extra."
+                )
+                log.warning("VLC failed to play the stream; falling back to mpv")
+            elif not mpv_available:
+                self.app.status = (
+                    "VLC could not play that stream and mpv is not installed. "
+                    "Install your distro's VLC codec plugins or mpv."
+                )
+                return -1
+            self.app.status = (
+                self._playback_note
+                or "Using mpv because VLC could not play the previous stream."
+            )
+            return self._run_mpv_with_progress(
+                stream_url, stream_headers, item, start_seconds=0
+            )
         return self._run_mpv_with_progress(
             stream_url, stream_headers, item, start_seconds=resume
         )
@@ -332,6 +665,9 @@ class DownloadManager:
             self.app.status = "Playback finished."
         else:
             self.app.status = f"Playback ended (code {code})."
+        note = self.take_playback_note()
+        if note:
+            self.app.status = f"{self.app.status} {note}"
         self.app.draw()
 
     def download_selected_link(self):

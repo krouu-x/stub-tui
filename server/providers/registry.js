@@ -146,8 +146,34 @@ function createFetchFunction(providerInfo) {
   };
 }
 
+// Provider priority: working/reliable providers first
+const PROVIDER_PRIORITY = {
+  '4khdhub': 10,    // Google Drive links work reliably
+  'castletv': 9,    // HLS works with headers
+  'netmirror': 8,   // HLS works with Referer
+  'dahmermovies': 7, // Directory works but worker blocked by Cloudflare
+  'vixsrc': 6,      // Token-based, often expires
+  'vidlink': 5,     // Often rate limited (429)
+  'streamflix': 4,  // DNS issues
+  'vaplayer': 3,
+  'videasy': 2,
+  'onetouchtv': 1,
+  'hdghartv': 1,
+  'zxcstreams': 1,
+  'showbox': 1,
+};
+
 // Initialize providers - always load all; enabled state is checked dynamically from live config
 const providerFiles = getProviderFiles();
+
+// Sort by priority (higher first), then alphabetically for stability
+providerFiles.sort((a, b) => {
+  const pa = PROVIDER_PRIORITY[a.name] || 0;
+  const pb = PROVIDER_PRIORITY[b.name] || 0;
+  if (pa !== pb) return pb - pa;
+  return a.name.localeCompare(b.name);
+});
+
 const providers = [];
 
 for (const providerInfo of providerFiles) {
@@ -155,7 +181,7 @@ for (const providerInfo of providerFiles) {
     name: providerInfo.name,
     fetch: createFetchFunction(providerInfo)
   });
-  console.log(`[registry] ${providerInfo.name} provider loaded`);
+  console.log(`[registry] ${providerInfo.name} provider loaded (priority: ${PROVIDER_PRIORITY[providerInfo.name] || 0})`);
 }
 
 function isProviderEnabled(name) {

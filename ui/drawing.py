@@ -269,9 +269,14 @@ def draw_history(app, stdscr, list_top, list_height, w):
 
 def draw_downloads(app, stdscr, list_top, list_height, w):
     source = app.detail.get("title") or app.detail.get("name") or "?" if app.detail else "?"
-    safe_addstr(stdscr, list_top - 1, 0, f"Stream links — {source}  ({len(app.download_links)} unique):".ljust(w), curses.A_UNDERLINE)
+    loading = getattr(app, "links_partial", False)
+    header = f"Stream links — {source}  ({len(app.download_links)} unique)"
+    if loading:
+        header += "  — still loading more…"
+    safe_addstr(stdscr, list_top - 1, 0, header.ljust(w), curses.A_UNDERLINE)
     if not app.download_links:
-        safe_addstr(stdscr, list_top, 2, "(no links resolved)")
+        message = "(resolving links…)" if loading else "(no links resolved)"
+        safe_addstr(stdscr, list_top, 2, message)
         return
     app.download_offset = app.adjust_scroll(
         app.download_selected, app.download_offset, list_height
@@ -303,6 +308,31 @@ def draw_new_screen(app, stdscr, list_top, list_height, w):
     safe_addstr(stdscr, list_top - 1, 0, "New Screen — opened with 'd'".ljust(w), curses.A_UNDERLINE)
     safe_addstr(stdscr, list_top, 2, "This is a new curses screen drawn when you press 'd'.")
     safe_addstr(stdscr, list_top + 1, 2, "Press Esc to go back to results.")
+
+
+def draw_providers(app, stdscr, list_top, list_height, w):
+    """Draw the provider management screen."""
+    safe_addstr(stdscr, list_top - 1, 0, "Provider Management  (j/k move, Space toggle, r refresh, Esc back)".ljust(w), curses.A_UNDERLINE)
+    if not getattr(app, "provider_list", None):
+        safe_addstr(stdscr, list_top, 2, "(no provider list loaded)")
+        return
+    providers = app.provider_list
+    app.provider_offset = app.adjust_scroll(
+        app.provider_selected, app.provider_offset, list_height
+    )
+    visible = providers[app.provider_offset: app.provider_offset + list_height]
+    for row, provider in enumerate(visible):
+        i = row + app.provider_offset
+        name = provider.get("name", "?")
+        enabled = provider.get("enabled", True)
+        status = "[ON]" if enabled else "[OFF]"
+        line = f"{status}  {name}"
+        attr = curses.color_pair(5) if i == app.provider_selected else 0
+        safe_addstr(stdscr, list_top + row, 2, line, attr)
+    if len(providers) > list_height:
+        safe_addstr(
+            stdscr, list_top - 1, w - 14, f"[{app.provider_selected + 1}/{len(providers)}]"
+        )
 
 
 def draw_season_download(app, stdscr, list_top, list_height, w):

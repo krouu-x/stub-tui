@@ -75,6 +75,26 @@ async function prefetchSegment(url, headers) {
 
 const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
+// Warming up every segment in a playlist at once made playback slower: the
+// burst competed with the segment the player actually needed. Only prefetch
+// the first few segments, with low concurrency, to shorten time-to-play.
+const PREFETCH_SEGMENTS = Math.max(0, Number(process.env.TMDB_PROXY_PREFETCH_SEGMENTS) || 3);
+const PREFETCH_CONCURRENCY = Math.max(1, Number(process.env.TMDB_PROXY_PREFETCH_CONCURRENCY) || 2);
+
+async function prefetchSegments(urls, headers, limit = PREFETCH_SEGMENTS) {
+    if (isCacheDisabled() || limit <= 0) return;
+    const queue = urls.slice(0, limit);
+    let next = 0;
+    const runners = Array.from({ length: Math.min(PREFETCH_CONCURRENCY, queue.length) }, async () => {
+        for (;;) {
+            const index = next++;
+            if (index >= queue.length) return;
+            await prefetchSegment(queue[index], headers);
+        }
+    });
+    await Promise.all(runners);
+}
+
 function inferContentType(upstreamCT, targetUrl) {
     const bad = !upstreamCT || /application\/octet-stream/i.test(upstreamCT) || /application\/(x-)?zip/i.test(upstreamCT);
     if (!bad) return upstreamCT;
@@ -149,7 +169,7 @@ function rewriteM3u8(content, targetUrl, baseProxyUrl, headers) {
         } else out.push(line);
     }
     if (segmentUrls.length && !isCacheDisabled()) {
-        Promise.all(segmentUrls.map(u => prefetchSegment(u, headers))).catch(() => undefined);
+        prefetchSegments(segmentUrls, headers).catch(() => undefined);
     }
     return out.join('\n');
 }

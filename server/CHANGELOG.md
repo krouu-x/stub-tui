@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Performance
+- **Aggregate endpoint answers early**: `/api/streams/:type/:tmdbId` now returns whatever providers have finished by a soft deadline (default 6s; 2s with `?fast=1`) while the remaining providers keep filling the cache in the background. `TMDB_AGGREGATE_DEADLINE_MS` / `TMDB_FAST_DEADLINE_MS` configure this.
+- **In-flight request coalescing**: concurrent requests for the same title share one scrape instead of duplicating every upstream call.
+- **Stale-while-revalidate cache**: cached results are served instantly for up to 2 minutes fresh plus 3 minutes stale, with a background refresh (configurable via `TMDB_STREAM_CACHE_TTL_MS` / `TMDB_STREAM_CACHE_STALE_MS`).
+- **4KHDHub redirect resolution parallelized** with bounded concurrency, cutting its scrape time roughly in half.
+- **IMDb enrichment no longer delays responses** — it is only attached when ready.
+- **HLS proxy prefetch bounded** to the first few segments at low concurrency, so warming the cache no longer competes with the segment the player is waiting for.
+- **Keep-alive upstream connections** for provider scrapes.
+
 ## [1.3.0] - 2026-08-19
 
 ### Added

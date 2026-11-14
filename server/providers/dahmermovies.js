@@ -4,9 +4,14 @@ const { getTmdbApiKey } = require('../utils/tmdbKey');
 const DAHMER_MOVIES_API = 'https://a.111477.xyz';
 const DAHMER_WORKER_API = 'https://p.111477.xyz/bulk?u=';
 
+// Cookie string for a.111477.xyz (set via DAHMERMOVIES_COOKIES env var)
+// Example: "cf_clearance=...; sessionid=..."
+const DAHMER_COOKIES = process.env.DAHMERMOVIES_COOKIES || '';
+
 const REQUEST_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Referer': `${DAHMER_MOVIES_API}/`
+    'Referer': `${DAHMER_MOVIES_API}/`,
+    ...(DAHMER_COOKIES ? { 'Cookie': DAHMER_COOKIES } : {}),
 };
 
 function parseLinks(html) {
@@ -140,7 +145,8 @@ async function getDahmermoviesStreams(tmdbId, mediaType = 'movie', seasonNum = n
                 'User-Agent': REQUEST_HEADERS['User-Agent'],
                 'Referer': `${DAHMER_MOVIES_API}/`,
                 'Accept': '*/*',
-                'Range': 'bytes=0-'
+                'Range': 'bytes=0-',
+                ...(DAHMER_COOKIES ? { 'Cookie': DAHMER_COOKIES } : {}),
             }
         });
     }

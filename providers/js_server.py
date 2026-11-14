@@ -113,7 +113,8 @@ class JSServerClient:
         season: Optional[int] = None,
         episode: Optional[int] = None,
         provider: Optional[str] = None,
-    ) -> List[Dict]:
+        fast: bool = False,
+    ) -> Dict:
         """
         Get streams from the JS server.
 
@@ -123,9 +124,12 @@ class JSServerClient:
             season: Season number (for TV)
             episode: Episode number (for TV)
             provider: Specific provider name, or None for all enabled providers
+            fast: Ask the server not to wait for slow providers (playback path)
 
         Returns:
-            List of stream objects
+            The full response payload. ``payload["streams"]`` holds the stream
+            objects and ``payload["partial"]`` is set when the server answered
+            before slower providers finished (the rest keep loading server-side).
         """
         # Convert media_type to JS server format
         js_type = "movie" if media_type == "movie" else "series"
@@ -140,9 +144,10 @@ class JSServerClient:
             params["season"] = season
         if episode:
             params["episode"] = episode
+        if fast:
+            params["fast"] = "1"
 
-        data = self._make_request(endpoint, params=params)
-        return data.get("streams", [])
+        return self._make_request(endpoint, params=params)
 
     def check_health(self, timeout: float = 2.0, ttl: float = 10.0) -> bool:
         """Check if JS server is reachable.
@@ -174,19 +179,31 @@ def _get_js_client() -> JSServerClient:
     return _js_client
 
 
-def fetch(
+def fetch_streams(
     tmdb_id: str,
     title: str,
     media_type: str,
     season_num: str,
     episode_num: str,
     year: str = "",
-) -> List[Tuple[str, Dict[str, str]]]:
+    fast: bool = False,
+) -> Tuple[List[Tuple[str, Dict[str, str]]], bool]:
     """
-    Fetch streams from the JS server.
+    Fetch streams from the JS server, reporting whether the list is complete.
 
     This replaces all inline Python providers by delegating to the
     TMDB-Embed-API-main Node.js server.
+
+    Args:
+        fast: Ask the server to answer as soon as a few providers are ready
+            instead of waiting for all of them. Used for playback and for the
+            first paint of the downloads list.
+
+    Returns:
+        ``(streams, partial)``. ``partial`` is True when the server answered
+        early and more links are still being resolved in the background. Call
+        again to pick up the completed list (partial responses are never
+        cached).
     """
     client = _get_js_client()
 
@@ -200,7 +217,7 @@ def fetch(
         hit = _STREAM_CACHE.get(cache_key)
     if hit and (now - hit[0]) < STREAM_CACHE_TTL:
         log.info("JS Server: stream cache hit for %s", cache_key)
-        return [(url, dict(headers)) for url, headers in hit[1]]
+        return [(url, dict(headers)) for url, headers in hit[1]], False
 
     # Check server health first (cached for a few seconds inside the client).
     # A background start-up from the TUI is waited out rather than failed.
@@ -210,10 +227,17 @@ def fetch(
             "Start it with: cd stub_main/server && npm start"
         )
 
-    # Get streams from all enabled providers
-    streams_data = client.get_streams(tmdb_id, media_type, season, episode)
+    # Get streams from all enabled providers. The server may answer early with
+    # a partial payload while slower providers keep loading; that partial
+    # response is usable immediately and is not cached here so the next fetch
+    # can pick up the completed result.
+    payload = client.get_streams(tmdb_id, media_type, season, episode, fast=fast)
+    streams_data = payload.get("streams", []) or []
+    partial = bool(payload.get("partial"))
 
     if not streams_data:
+        if partial:
+            return [], True
         raise Exception("No streams returned from JS server")
 
     # Convert to our format: (url, headers)
@@ -256,29 +280,63 @@ def fetch(
         candidate_streams.append((url, headers))
 
     if not candidate_streams:
+        if partial:
+            return [], True
         raise Exception("No valid stream URLs found in JS server response")
 
     # Seekable sources first: the app plays the first stream that starts, and
     # non-seekable ones (Google Drive) cannot be skipped/seeked inside.
-    seekable = sum(1 for url, _ in candidate_streams if is_seekable(url))
     candidate_streams = prioritize_seekable(candidate_streams)
+    seekable = sum(1 for url, _ in candidate_streams if is_seekable(url))
     log.info(
-        "JS Server: got %d playable stream(s) (%d seekable)",
+        "JS Server: got %d playable stream(s) (%d seekable)%s",
         len(candidate_streams),
         seekable,
+        " [partial]" if partial else "",
     )
 
-    # Cache a copy briefly; callers get their own copy back so header edits
-    # (e.g. X-Provider) never leak into the cache.
-    with _STREAM_CACHE_LOCK:
-        if len(_STREAM_CACHE) >= STREAM_CACHE_MAX:
-            _STREAM_CACHE.clear()
-        _STREAM_CACHE[cache_key] = (
-            time.monotonic(),
-            [(url, dict(headers)) for url, headers in candidate_streams],
-        )
+    # Cache a complete copy briefly; callers get their own copy back so header
+    # edits (e.g. X-Provider) never leak into the cache. Partial responses are
+    # deliberately not cached — the server is still filling in providers, and
+    # the next fetch should be able to return the complete list.
+    if not partial:
+        with _STREAM_CACHE_LOCK:
+            if len(_STREAM_CACHE) >= STREAM_CACHE_MAX:
+                _STREAM_CACHE.clear()
+            _STREAM_CACHE[cache_key] = (
+                time.monotonic(),
+                [(url, dict(headers)) for url, headers in candidate_streams],
+            )
 
-    return candidate_streams
+    return candidate_streams, partial
+
+
+def fetch(
+    tmdb_id: str,
+    title: str,
+    media_type: str,
+    season_num: str,
+    episode_num: str,
+    year: str = "",
+    fast: bool = False,
+) -> List[Tuple[str, Dict[str, str]]]:
+    """Fetch streams from the JS server, hiding the partial flag.
+
+    Kept for callers that only need a usable list. Use
+    :func:`fetch_streams` when a partial result should be retried.
+    """
+    streams, _partial = fetch_streams(
+        tmdb_id,
+        title,
+        media_type,
+        season_num,
+        episode_num,
+        year=year,
+        fast=fast,
+    )
+    if not streams:
+        raise Exception("No streams returned from JS server")
+    return streams
 
 
 # Also export a function to get available providers for UI display

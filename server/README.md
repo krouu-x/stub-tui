@@ -173,6 +173,11 @@ If both `TMDB_API_KEY` and `TMDB_API_KEYS` are provided, rotation uses the array
 | `NETMIRROR_STREAM_REFERER` | NetMirror stream Referer header | Optional override |
 | `TMDB_SERVER_VERBOSE` | Show per-request provider logs | Default off (quiet); set `1` for debugging |
 | `TMDB_PROVIDER_TIMEOUT_MS` | Per-provider time cap | Defaults to `20000`; timed-out providers return no streams |
+| `TMDB_STREAM_CACHE_TTL_MS` | Fresh aggregate cache lifetime | Defaults to `120000` (2 min) |
+| `TMDB_STREAM_CACHE_STALE_MS` | Serve-stale window after the TTL | Defaults to `180000` (3 min), refreshed in the background |
+| `TMDB_AGGREGATE_DEADLINE_MS` | Max wait for the aggregate endpoint | Defaults to `6000`; slower providers finish in the background (`0` = wait for all) |
+| `TMDB_FAST_DEADLINE_MS` | Max wait when a client sends `?fast=1` | Defaults to `2000`; used by playback |
+| `TMDB_PROXY_PREFETCH_SEGMENTS` / `TMDB_PROXY_PREFETCH_CONCURRENCY` | HLS segments warmed up ahead of playback | Defaults to `3` / `2` |
 
 ### Updating the Image
 ```bash

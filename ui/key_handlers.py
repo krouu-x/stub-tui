@@ -47,6 +47,8 @@ class KeyHandler:
             self.handle_key_history(key)
         elif self.app.screen == SCREEN_DOWNLOADS:
             self.handle_key_downloads(key)
+        elif self.app.screen == SCREEN_PROVIDERS:
+            self.handle_key_providers(key)
         elif self.app.screen == SCREEN_NEW:
             self.handle_key_new(key)
         elif self.app.screen == SCREEN_SEASON_DOWNLOAD:
@@ -77,6 +79,8 @@ class KeyHandler:
             self.app.show_history()
         elif key == ord("t"):
             self.app.load_trending()
+        elif key in (ord("P"),):
+            self.app.open_providers()
         elif key == 27:
             self.app.screen = SCREEN_RESULTS
             self.app.error = None
@@ -248,6 +252,7 @@ class KeyHandler:
 
     def handle_key_downloads(self, key):
         if key == 27:
+            self.app.stop_live_link_updates()
             self.app.screen = SCREEN_RESULTS
             self.app.error = None
             self.app.status = "Back to results."
@@ -274,6 +279,26 @@ class KeyHandler:
             self.app.error = None
             self.app.status = "Back to results."
             return
+
+    def handle_key_providers(self, key):
+        if key == 27:
+            self.app.screen = SCREEN_HOME
+            self.app.status = "Back to home."
+            return
+        if key in (curses.KEY_DOWN, ord("j")):
+            if getattr(self.app, "provider_list", None):
+                self.app.provider_selected = min(self.app.provider_selected + 1, len(self.app.provider_list) - 1)
+        elif key in (curses.KEY_UP, ord("k")):
+            if getattr(self.app, "provider_list", None):
+                self.app.provider_selected = max(self.app.provider_selected - 1, 0)
+        elif key == ord(" "):
+            # Toggle provider
+            if getattr(self.app, "provider_list", None):
+                provider = self.app.provider_list[self.app.provider_selected]
+                enabled = provider.get("enabled", True)
+                self.app._toggle_provider(not enabled)
+        elif key in (ord("r"), ord("R")):
+            self.app._fetch_provider_list()
 
     def handle_key_season_download(self, key):
         if key in (27, ord("q"), ord("Q")):

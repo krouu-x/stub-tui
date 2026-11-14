@@ -2,6 +2,7 @@
 import os
 import sys
 import time
+import inspect
 import curses
 import locale
 import logging
@@ -202,9 +203,23 @@ class App:
     def _link_sizes(self, value: Dict[str, int]) -> None:
         self.download_manager._link_sizes = value
 
+    @property
+    def links_partial(self) -> bool:
+        """True while more links are still being resolved for the list."""
+        return self.download_manager.links_partial
+
     # Delegate methods to download manager
     def gather_download_links(self, *args, **kwargs):
         return self.download_manager.gather_download_links(*args, **kwargs)
+
+    def resolve_download_links(self, *args, **kwargs):
+        return self.download_manager.resolve_download_links(*args, **kwargs)
+
+    def start_live_link_updates(self, *args, **kwargs):
+        return self.download_manager.start_live_link_updates(*args, **kwargs)
+
+    def stop_live_link_updates(self):
+        return self.download_manager.stop_live_link_updates()
 
     def _prefetch_link_sizes(self, links):
         self.download_manager._prefetch_link_sizes(links)
@@ -318,7 +333,58 @@ class App:
         self.screen = SCREEN_TRENDING
         self.status = f"Trending ({len(self.trending)} items)"
 
-    def get_tv_seasons(self):
+    # Provider management
+    def open_providers(self):
+        """Open the provider management screen."""
+        self.screen = SCREEN_PROVIDERS
+        self.provider_selected = 0
+        self.provider_offset = 0
+        self._fetch_provider_list()
+
+    def _fetch_provider_list(self):
+        """Fetch provider list from the JS server."""
+        self.status = "Loading provider list..."
+        self.draw()
+        try:
+            resp = self.client.session.get(f"{self.client.base_url}/api/providers", timeout=10)
+            if resp.ok:
+                data = resp.json()
+                self.provider_list = data.get("providers", [])
+                self.status = f"Providers loaded ({len(self.provider_list)})"
+            else:
+                self.provider_list = []
+                self.status = "Failed to load providers"
+        except Exception as e:
+            self.provider_list = []
+            self.status = f"Provider list error: {e}"
+        self.draw()
+
+    def _toggle_provider(self, enable: bool):
+        """Enable or disable the selected provider."""
+        if not self.provider_list:
+            return
+        provider = self.provider_list[self.provider_selected]
+        name = provider.get("name", "").lower()
+        if not name:
+            return
+        self.status = f"{'Enabling' if enable else 'Disabling'} {name}..."
+        self.draw()
+        try:
+            flag = f"enable{name.capitalize()}Provider"
+            patch = {flag: enable}
+            resp = self.client.session.post(
+                f"{self.client.base_url}/api/config",
+                json=patch,
+                timeout=10
+            )
+            if resp.ok:
+                self._fetch_provider_list()
+                self.status = f"{name} {'enabled' if enable else 'disabled'}"
+            else:
+                self.status = f"Failed: {resp.status_code}"
+        except Exception as e:
+            self.status = f"Error: {e}"
+        self.draw()
         if not self.detail or self.detail.get("media_type") != "tv":
             return []
         return sorted(self.detail.get("seasons", []), key=lambda s: s.get("season_number", 0))
@@ -516,6 +582,9 @@ class App:
             self.status = "No media selected."
             return
 
+        # Cancel any refresh from a previous visit before replacing the list.
+        self.stop_live_link_updates()
+
         media_type = self.detail.get("media_type", "movie")
         tmdb_id = str(self.detail.get("id", ""))
         title = self.detail.get("title") or self.detail.get("name", "")
@@ -532,48 +601,64 @@ class App:
 
         self.status = "Resolving links from all providers..."
         self.draw()
-        links = self.gather_download_links(
-            tmdb_id, title, media_type, season_num, episode_num, year=year
-        )
+
+        # Ask for a fast, partial answer so the list paints immediately. The
+        # server keeps resolving providers in the background and the live
+        # updater folds their links in as they arrive.
+        try:
+            links, partial = self.resolve_download_links(
+                tmdb_id,
+                title,
+                media_type,
+                season_num,
+                episode_num,
+                year=year,
+                fast=True,
+            )
+        except Exception as e:
+            log.warning("Link resolution failed: %s", e)
+            links, partial = [], False
+
         self.download_links = links
-        self.download_manager.download_links = links
         self.download_selected = 0
-        self.download_manager.download_selected = 0
         self.download_offset = 0
-        self.download_manager.download_offset = 0
-        # Always transition to the downloads screen so the user sees the
-        # (empty) list and a clear status, rather than staying on the detail
-        # screen where Enter/p/d have different meanings.
-        self.screen = SCREEN_DOWNLOADS
         self._link_sizes = {}
-        self.download_manager._link_sizes = {}
-        if not links:
+        # Always transition to the downloads screen so the user sees the
+        # (possibly still growing) list and a clear status, rather than
+        # staying on the detail screen where Enter/p/d mean something else.
+        self.screen = SCREEN_DOWNLOADS
+
+        if not links and not partial:
             self.status = "No stream links found from any provider."
+            self.draw()
             return
-        self.status = self._downloads_hint(len(links))
+
+        if partial:
+            self.status = self.download_manager._loading_hint(len(links))
+            self.start_live_link_updates(
+                tmdb_id, title, media_type, season_num, episode_num, year=year
+            )
+        else:
+            self.status = self._downloads_hint(len(links))
         self.draw()
-        self._prefetch_link_sizes_async(links)
+        if links:
+            self._prefetch_link_sizes_async(links)
 
     @staticmethod
     def _downloads_hint(count: int) -> str:
-        return f"Stream links ({count} unique): p play   d download   Esc back"
+        return DownloadManager._downloads_hint(count)
 
     def _prefetch_link_sizes_async(self, links):
         """Probe link sizes in the background so the UI stays responsive."""
         link_list = list(links)
 
-        def worker():
-            try:
-                self.download_manager._prefetch_link_sizes(link_list)
-            except Exception:
-                pass
-            finally:
-                # Only refresh the status if the user is still looking at
-                # this list (curses must only be touched from the main thread).
-                if self.screen == SCREEN_DOWNLOADS and self.download_links is links:
-                    self.status = self._downloads_hint(len(links))
+        def done():
+            # Only refresh the status if the user is still looking at this
+            # list (curses must only be touched from the main thread).
+            if self.screen == SCREEN_DOWNLOADS and not self.links_partial:
+                self.status = self._downloads_hint(len(self.download_links))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self.download_manager.prefetch_link_sizes_async(link_list, on_done=done)
 
     def play_stream(self, start_provider_idx=None):
         if not self.detail:
@@ -612,9 +697,17 @@ class App:
             self.draw()
             self.stdscr.refresh()
 
+            # Playback only needs one working link, so ask providers that
+            # support it to return early instead of waiting for every source.
+            fetch_kwargs = {"year": year}
+            try:
+                if "fast" in inspect.signature(provider.fetch_func).parameters:
+                    fetch_kwargs["fast"] = True
+            except (TypeError, ValueError):
+                pass
             try:
                 candidate_streams = provider.fetch_func(
-                    tmdb_id, title, media_type, season_num, episode_num, year=year
+                    tmdb_id, title, media_type, season_num, episode_num, **fetch_kwargs
                 )
             except Exception as e:
                 log.warning("%s failed: %s", provider.name, e)
@@ -647,6 +740,9 @@ class App:
 
             if provider_success:
                 self.status = "Playback finished."
+                note = self.download_manager.take_playback_note()
+                if note:
+                    self.status = f"{self.status} {note}"
                 self.draw()
                 self.stdscr.refresh()
                 return
@@ -656,6 +752,9 @@ class App:
             self.stdscr.refresh()
 
         self.status = "All providers failed to find or play streams."
+        note = self.download_manager.take_playback_note()
+        if note:
+            self.status = f"{self.status} {note}"
         self.draw()
         self.stdscr.refresh()
 
@@ -692,6 +791,8 @@ class App:
             draw_history(self, stdscr, list_top, list_height, w)
         elif self.screen == SCREEN_DOWNLOADS:
             draw_downloads(self, stdscr, list_top, list_height, w)
+        elif self.screen == SCREEN_PROVIDERS:
+            draw_providers(self, stdscr, list_top, list_height, w)
         elif self.screen == SCREEN_NEW:
             draw_new_screen(self, stdscr, list_top, list_height, w)
         elif self.screen == SCREEN_SEASON_DOWNLOAD:
@@ -710,7 +811,7 @@ class App:
     def _base_help_text(self):
         provider_help = "  ".join([f"{p.key} {p.name}" for p in PROVIDERS]) + "  p Play (Auto)"
         if self.screen == SCREEN_HOME:
-            return ("j/k Select   Enter Resume   / Search   h History   t Trending   q Quit")
+            return ("j/k Select   Enter Resume   / Search   h History   t Trending   P Providers   q Quit")
         if self.screen == SCREEN_RESULTS:
             return (" / Search   y Year   i ID lookup   t Trending   h History   "
                     "Tab Movie/TV ID type   j/k Move   Enter Open   q Quit")
@@ -728,6 +829,8 @@ class App:
             return f"{provider_help}   j/k Move   Enter Open   c Clear   Esc Back"
         if self.screen == SCREEN_DOWNLOADS:
             return f"{provider_help}   j/k Move   p Play   d Download   Esc Back"
+        if self.screen == SCREEN_PROVIDERS:
+            return "j/k Move   Space Toggle   r Refresh   Esc Back"
         return ""
 
     # Key handling delegation

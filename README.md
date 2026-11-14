@@ -325,6 +325,21 @@ brew install mpv
 # Windows: Download from mpv.io
 ```
 
+### VLC errors on Linux ("Codec ... is not supported", "Failed to create demuxer")
+Many Linux VLC packages ship without the optional codec/demux plugins, so HEVC
+(H.265), E-AC3 audio and MPEG-TS/HLS streams fail while VLC still exits as if
+playback finished. mpv decodes through ffmpeg, so the app now detects this and
+falls back to mpv automatically (for the rest of the session).
+
+To fix VLC itself, install its plugin packages:
+```bash
+# Arch:
+sudo pacman -S vlc-plugins-extra
+
+# Debian/Ubuntu:
+sudo apt install vlc-plugin-base vlc-plugin-extra-codecs
+```
+
 ### Python import errors
 ```bash
 # Reinstall dependencies
